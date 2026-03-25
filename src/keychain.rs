@@ -49,7 +49,6 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use anyhow::{anyhow, Context, Result};
-    use windows::Win32::Foundation::TRUE;
     use windows::Win32::Security::Credentials::{
         CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS, CRED_PERSIST_LOCAL_MACHINE,
         CRED_TYPE_GENERIC,

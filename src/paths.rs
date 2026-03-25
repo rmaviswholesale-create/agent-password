@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 
 pub const APP_DIR_NAME: &str = ".agent-password";
 pub const DATABASE_NAME: &str = "vault.db";
+#[cfg(unix)]
 pub const SOCKET_NAME: &str = "daemon.sock";
 
 pub fn app_dir() -> Result<PathBuf> {

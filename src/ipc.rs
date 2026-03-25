@@ -115,14 +115,21 @@ mod imp {
         CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, GENERIC_READ, GENERIC_WRITE,
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_NONE,
         OPEN_EXISTING,
     };
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_ACCESS_DUPLEX,
-        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows::core::PCWSTR;
+
+    // PIPE_ACCESS_DUPLEX (3) — open-mode flag for CreateNamedPipeW.
+    // Not re-exported from Win32::System::Pipes in windows 0.58; define inline.
+    const PIPE_ACCESS_DUPLEX: FILE_FLAGS_AND_ATTRIBUTES = FILE_FLAGS_AND_ATTRIBUTES(3);
+    // GENERIC_READ (0x80000000) | GENERIC_WRITE (0x40000000) for CreateFileW.
+    // In windows 0.58 CreateFileW takes a plain u32 for dwDesiredAccess.
+    const GENERIC_RW: u32 = 0xC000_0000u32;
 
     fn to_wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0u16)).collect()
@@ -219,7 +226,7 @@ mod imp {
             Ok(()) => {}
             Err(e) if e.code() == ERROR_PIPE_CONNECTED.to_hresult() => {}
             Err(e) => {
-                unsafe { CloseHandle(handle) };
+                let _ = unsafe { CloseHandle(handle) };
                 return Err(anyhow!("ConnectNamedPipe failed: {e}"));
             }
         }
@@ -254,7 +261,7 @@ mod imp {
                 io::Error::last_os_error()
             ));
         }
-        unsafe { CloseHandle(handle) };
+        let _ = unsafe { CloseHandle(handle) };
         Ok(IpcListener { name })
     }
 
@@ -267,12 +274,12 @@ mod imp {
             match unsafe {
                 CreateFileW(
                     PCWSTR(wide.as_ptr()),
-                    FILE_ACCESS_RIGHTS(GENERIC_READ.0 | GENERIC_WRITE.0),
+                    GENERIC_RW,
                     FILE_SHARE_NONE,
                     None,
                     OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL,
-                    HANDLE(0),
+                    HANDLE(std::ptr::null_mut()),
                 )
             } {
                 Ok(handle) => {
@@ -285,7 +292,7 @@ mod imp {
                         == windows::Win32::Foundation::ERROR_PIPE_BUSY.to_hresult() =>
                 {
                     // All instances busy; wait up to 5 s then retry.
-                    unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), 5000) };
+                    let _ = unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), 5000) };
                 }
                 Err(e) => return Err(anyhow!("failed to connect to named pipe {name}: {e}")),
             }
