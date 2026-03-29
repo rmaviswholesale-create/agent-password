@@ -159,10 +159,138 @@ mod platform {
 }
 
 // ---------------------------------------------------------------------------
+// Linux — Unix account password verified via PAM (raw C bindings, no crate)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use std::ffi::CString;
+
+    use anyhow::{anyhow, Result};
+    use libc::{c_char, c_int, c_void};
+    use rpassword::prompt_password;
+
+    // -----------------------------------------------------------------------
+    // Minimal PAM types
+    // -----------------------------------------------------------------------
+    enum PamHandle {} // opaque
+
+    const PAM_SUCCESS: c_int = 0;
+    const PAM_PROMPT_ECHO_OFF: c_int = 1;
+
+    #[repr(C)]
+    struct PamMessage {
+        msg_style: c_int,
+        msg: *const c_char,
+    }
+
+    #[repr(C)]
+    struct PamResponse {
+        resp: *mut c_char,
+        resp_retcode: c_int,
+    }
+
+    #[repr(C)]
+    struct PamConv {
+        conv: unsafe extern "C" fn(
+            num_msg: c_int,
+            msg: *const *const PamMessage,
+            resp: *mut *mut PamResponse,
+            appdata_ptr: *mut c_void,
+        ) -> c_int,
+        appdata_ptr: *mut c_void,
+    }
+
+    #[link(name = "pam")]
+    extern "C" {
+        fn pam_start(
+            service: *const c_char,
+            user: *const c_char,
+            conv: *const PamConv,
+            pamh: *mut *mut PamHandle,
+        ) -> c_int;
+        fn pam_authenticate(pamh: *mut PamHandle, flags: c_int) -> c_int;
+        fn pam_end(pamh: *mut PamHandle, status: c_int) -> c_int;
+    }
+
+    // PAM conversation callback: copy the stored password into each
+    // PAM_PROMPT_ECHO_OFF message slot, ignore others.
+    unsafe extern "C" fn conv_fn(
+        num_msg: c_int,
+        msg: *const *const PamMessage,
+        resp: *mut *mut PamResponse,
+        appdata_ptr: *mut c_void,
+    ) -> c_int {
+        let password = &*(appdata_ptr as *const String);
+        let responses = libc::calloc(num_msg as usize, std::mem::size_of::<PamResponse>()) as *mut PamResponse;
+        if responses.is_null() {
+            return 99; // PAM_CONV_ERR
+        }
+        for i in 0..num_msg as isize {
+            let m = &**msg.offset(i);
+            if m.msg_style == PAM_PROMPT_ECHO_OFF {
+                let cpass = CString::new(password.as_str()).unwrap_or_default();
+                (*responses.offset(i)).resp = libc::strdup(cpass.as_ptr());
+            }
+        }
+        *resp = responses;
+        PAM_SUCCESS
+    }
+
+    pub fn authenticate(reason: &str) -> Result<()> {
+        // root never needs to re-authenticate.
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("[agent-password] {reason} — running as root, auto-approved");
+            return Ok(());
+        }
+
+        let username = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| "user".to_string());
+
+        let password = prompt_password(format!(
+            "[agent-password] {reason}\nPassword for {username}: "
+        ))
+        .map_err(|e| anyhow!("failed to read password: {e}"))?;
+
+        let svc = CString::new("su").unwrap();
+        let user = CString::new(username.as_str()).unwrap();
+        // Store password on the heap so the pointer stays valid for the whole PAM call.
+        let pw_box = Box::new(password);
+        let pw_ptr = Box::into_raw(pw_box);
+
+        let conv = PamConv {
+            conv: conv_fn,
+            appdata_ptr: pw_ptr as *mut c_void,
+        };
+
+        let mut pamh: *mut PamHandle = std::ptr::null_mut();
+        let result = unsafe {
+            let rc = pam_start(svc.as_ptr(), user.as_ptr(), &conv, &mut pamh);
+            if rc != PAM_SUCCESS {
+                drop(Box::from_raw(pw_ptr));
+                return Err(anyhow!("pam_start failed ({})", rc));
+            }
+            let rc = pam_authenticate(pamh, 0);
+            pam_end(pamh, rc);
+            // Reclaim the password box so it is dropped (zeroed by Rust's drop).
+            drop(Box::from_raw(pw_ptr));
+            rc
+        };
+
+        if result == PAM_SUCCESS {
+            Ok(())
+        } else {
+            Err(anyhow!("authentication failed"))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unsupported platforms — compile-time stub
 // ---------------------------------------------------------------------------
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod platform {
     use anyhow::{anyhow, Result};
 

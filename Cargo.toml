@@ -38,5 +38,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
 ] }
 
-[dev-dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
+rpassword = "7"
+
 tempfile = "3.20.0"

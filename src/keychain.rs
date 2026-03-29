@@ -116,10 +116,58 @@ mod platform {
 }
 
 // ---------------------------------------------------------------------------
+// Linux — key file at <app-dir>/vault.key (mode 0600)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use std::fs;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    use anyhow::{Context, Result};
+
+    fn key_path(service: &str) -> std::path::PathBuf {
+        crate::paths::app_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .join(format!("{}.key", service.replace('/', "_")))
+    }
+
+    pub fn store(key: &[u8], service: &str, _account: &str) -> Result<()> {
+        let path = key_path(service);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        // Write with mode 0600 so only the owning user can read it.
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(key)
+            })
+            .with_context(|| format!("failed to write key file {}", path.display()))?;
+        // Force 0600 even if the file already existed with looser permissions.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn load(service: &str, _account: &str) -> Result<Vec<u8>> {
+        let path = key_path(service);
+        fs::read(&path)
+            .with_context(|| format!("failed to read key file {} — run `vault init` first", path.display()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unsupported platforms — compile-time stub
 // ---------------------------------------------------------------------------
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod platform {
     use anyhow::{anyhow, Result};
 
