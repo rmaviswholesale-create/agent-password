@@ -49,11 +49,11 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use anyhow::{anyhow, Context, Result};
+    use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Security::Credentials::{
         CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS, CRED_PERSIST_LOCAL_MACHINE,
         CRED_TYPE_GENERIC,
     };
-    use windows::core::{PCWSTR, PWSTR};
 
     /// Encode a string as a null-terminated UTF-16 wide string.
     fn to_wide(s: &str) -> Vec<u16> {
@@ -99,9 +99,7 @@ mod platform {
         .context("failed to load vault key from Windows Credential Manager")?;
 
         if pcred.is_null() {
-            return Err(anyhow!(
-                "vault key not found in Windows Credential Manager"
-            ));
+            return Err(anyhow!("vault key not found in Windows Credential Manager"));
         }
 
         let key = unsafe {
@@ -158,8 +156,12 @@ mod platform {
 
     pub fn load(service: &str, _account: &str) -> Result<Vec<u8>> {
         let path = key_path(service);
-        fs::read(&path)
-            .with_context(|| format!("failed to read key file {} — run `vault init` first", path.display()))
+        fs::read(&path).with_context(|| {
+            format!(
+                "failed to read key file {} — run `vault init` first",
+                path.display()
+            )
+        })
     }
 }
 
@@ -172,10 +174,14 @@ mod platform {
     use anyhow::{anyhow, Result};
 
     pub fn store(_key: &[u8], _service: &str, _account: &str) -> Result<()> {
-        Err(anyhow!("credential storage is not supported on this platform"))
+        Err(anyhow!(
+            "credential storage is not supported on this platform"
+        ))
     }
 
     pub fn load(_service: &str, _account: &str) -> Result<Vec<u8>> {
-        Err(anyhow!("credential storage is not supported on this platform"))
+        Err(anyhow!(
+            "credential storage is not supported on this platform"
+        ))
     }
 }

@@ -5,6 +5,9 @@ use serde_json::{Map, Value};
 
 use crate::storage::SecretMetadata;
 
+// Variant names mirror the CLI command tree (`secrets request` →
+// SecretsRequest), so the overlap with the enum name is intentional.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     VaultInit,
@@ -115,7 +118,10 @@ pub struct RequestedSecret {
 
 #[derive(Debug, Default)]
 pub struct SessionState {
-    pub unlocked_key: Option<Vec<u8>>,
+    /// Vault key held in daemon memory while the session is unlocked.
+    /// Zeroizing guarantees the bytes are wiped when the session is
+    /// closed, cleared, or replaced.
+    pub unlocked_key: Option<zeroize::Zeroizing<Vec<u8>>>,
     pub approved_ids: BTreeSet<String>,
     pub pending_requests: BTreeMap<u64, PendingRequest>,
     pub next_request_id: u64,

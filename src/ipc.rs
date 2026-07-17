@@ -1,16 +1,16 @@
 //! Platform-independent IPC transport used by the daemon.
 //!
 //! * **Unix** — Unix-domain socket at `~/.agent-password/daemon.sock`
-//!              (mode 0600, created fresh on each daemon start).
+//!   (mode 0600, created fresh on each daemon start).
 //! * **Windows** — Named pipe `\\.\pipe\<dir-stem>` derived from the same
-//!                 app-state path, providing equivalent security (only the
-//!                 creating user can open a pipe by default).
+//!   app-state path, providing equivalent security (only the
+//!   creating user can open a pipe by default).
 //!
 //! Both sides present a single `IpcStream` type that implements `Read`,
 //! `Write`, and `try_clone`, so the rest of `daemon.rs` is identical on
 //! every platform.
 
-pub use imp::{IpcStream, bind, connect};
+pub use imp::{bind, connect, IpcStream};
 
 // ---------------------------------------------------------------------------
 // Unix — UnixListener / UnixStream
@@ -85,9 +85,7 @@ mod imp {
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind {}", socket_path.display()))?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
-            .with_context(|| {
-                format!("failed to set permissions on {}", socket_path.display())
-            })?;
+            .with_context(|| format!("failed to set permissions on {}", socket_path.display()))?;
         Ok(IpcListener(listener))
     }
 
@@ -111,6 +109,7 @@ mod imp {
     use std::os::windows::io::FromRawHandle;
 
     use anyhow::{anyhow, Context, Result};
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
         CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
     };
@@ -122,7 +121,6 @@ mod imp {
         ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
         PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
-    use windows::core::PCWSTR;
 
     // PIPE_ACCESS_DUPLEX (3) — open-mode flag for CreateNamedPipeW.
     // Not re-exported from Win32::System::Pipes in windows 0.58; define inline.
@@ -287,10 +285,7 @@ mod imp {
                         File::from_raw_handle(handle.0 as *mut std::ffi::c_void)
                     }));
                 }
-                Err(e)
-                    if e.code()
-                        == windows::Win32::Foundation::ERROR_PIPE_BUSY.to_hresult() =>
-                {
+                Err(e) if e.code() == windows::Win32::Foundation::ERROR_PIPE_BUSY.to_hresult() => {
                     // All instances busy; wait up to 5 s then retry.
                     let _ = unsafe { WaitNamedPipeW(PCWSTR(wide.as_ptr()), 5000) };
                 }

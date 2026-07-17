@@ -96,10 +96,10 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use anyhow::{anyhow, Result};
+    use windows::core::HSTRING;
     use windows::Security::Credentials::UI::{
         UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
     };
-    use windows::core::HSTRING;
 
     pub fn authenticate(reason: &str) -> Result<()> {
         // Check that Windows Hello is usable on this device / account.
@@ -222,7 +222,8 @@ mod platform {
         appdata_ptr: *mut c_void,
     ) -> c_int {
         let password = &*(appdata_ptr as *const String);
-        let responses = libc::calloc(num_msg as usize, std::mem::size_of::<PamResponse>()) as *mut PamResponse;
+        let responses =
+            libc::calloc(num_msg as usize, std::mem::size_of::<PamResponse>()) as *mut PamResponse;
         if responses.is_null() {
             return 99; // PAM_CONV_ERR
         }

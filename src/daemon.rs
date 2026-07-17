@@ -206,8 +206,8 @@ impl Daemon {
                     ));
                 }
                 storage::initialize(&self.database_path)?;
-                let key = crate::crypto::generate_vault_key()?;
-                keychain::store_vault_key(&key)?;
+                let key = zeroize::Zeroizing::new(crate::crypto::generate_vault_key()?);
+                keychain::store_vault_key(key.as_slice())?;
                 Ok(Response::Ack {
                     message: "vault initialized".into(),
                 })
@@ -267,7 +267,7 @@ impl Daemon {
                         tags,
                         fields,
                     },
-                    &key,
+                    key.as_slice(),
                 )?;
                 Ok(Response::Ack {
                     message: format!("stored secret `{}`", metadata.id),
@@ -385,7 +385,7 @@ impl Daemon {
                     ));
                 }
                 biometric::authenticate("approve access to requested secrets")?;
-                let key = keychain::load_vault_key()?;
+                let key = zeroize::Zeroizing::new(keychain::load_vault_key()?);
                 let session = self
                     .session
                     .as_mut()
@@ -453,7 +453,8 @@ impl Daemon {
                 let key = session.unlocked_key.as_ref().ok_or_else(|| {
                     anyhow!("shared session is locked; approve a request to unlock it")
                 })?;
-                let all_fields = storage::read_secret_fields(&self.database_path, &id, key)?;
+                let all_fields =
+                    storage::read_secret_fields(&self.database_path, &id, key.as_slice())?;
                 let requested_fields = select_fields(&all_fields, &fields)?;
                 Ok(Response::SecretValues {
                     secret_id: id,
@@ -496,14 +497,14 @@ impl Daemon {
         }
     }
 
-    fn load_key_for_management(&self) -> Result<Vec<u8>> {
+    fn load_key_for_management(&self) -> Result<zeroize::Zeroizing<Vec<u8>>> {
         if let Some(session) = &self.session {
             if let Some(key) = &session.unlocked_key {
                 return Ok(key.clone());
             }
         }
         biometric::authenticate("unlock the password vault")?;
-        keychain::load_vault_key()
+        keychain::load_vault_key().map(zeroize::Zeroizing::new)
     }
 }
 
