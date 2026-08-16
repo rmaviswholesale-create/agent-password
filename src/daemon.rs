@@ -1,9 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -16,6 +13,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::biometric;
+use crate::ipc::{self, IpcStream};
 use crate::keychain;
 use crate::paths;
 use crate::protocol::{
@@ -23,14 +21,23 @@ use crate::protocol::{
 };
 use crate::storage::{self, SecretInput};
 
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Ensure the background daemon is running, starting it if necessary.
 pub fn ensure_daemon_running() -> Result<()> {
     if try_connect().is_ok() {
         return Ok(());
     }
 
-    let socket_path = paths::socket_path()?;
-    if socket_path.exists() {
-        let _ = fs::remove_file(&socket_path);
+    // On Unix, remove any stale socket file before spawning the daemon.
+    #[cfg(unix)]
+    {
+        let socket_path = paths::socket_path()?;
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path);
+        }
     }
 
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
@@ -40,7 +47,11 @@ pub fn ensure_daemon_running() -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+
+    // Detach the daemon from the calling process so it survives after the CLI exits.
+    #[cfg(unix)]
     unsafe {
+        use std::os::unix::process::CommandExt;
         command.pre_exec(|| {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
@@ -48,6 +59,16 @@ pub fn ensure_daemon_running() -> Result<()> {
             Ok(())
         });
     }
+
+    // On Windows use creation flags instead of setsid:
+    //   DETACHED_PROCESS   (0x00000008) — detach from parent console
+    //   CREATE_NO_WINDOW   (0x08000000) — suppress implicit console window
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0000_0008 | 0x0800_0000);
+    }
+
     command.spawn().context("failed to start internal daemon")?;
 
     for _ in 0..50 {
@@ -60,9 +81,11 @@ pub fn ensure_daemon_running() -> Result<()> {
     Err(anyhow!("internal daemon did not become ready"))
 }
 
+/// Send a request to the daemon and return its response.
 pub fn send(request: &Request) -> Result<Response> {
     ensure_daemon_running()?;
     let mut stream = try_connect().context("failed to connect to internal daemon")?;
+
     {
         let mut writer = BufWriter::new(&mut stream);
         serde_json::to_writer(&mut writer, request)
@@ -86,22 +109,15 @@ pub fn send(request: &Request) -> Result<Response> {
     Ok(response)
 }
 
+/// Main loop executed inside the daemon subprocess.
 pub fn run_daemon() -> Result<()> {
     let app_dir = paths::app_dir()?;
     fs::create_dir_all(&app_dir)
         .with_context(|| format!("failed to create {}", app_dir.display()))?;
 
-    let socket_path = paths::socket_path()?;
-    if socket_path.exists() {
-        let _ = fs::remove_file(&socket_path);
-    }
-
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind {}", socket_path.display()))?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to set permissions on {}", socket_path.display()))?;
-
+    let listener = ipc::bind()?;
     let shared = Arc::new(Mutex::new(Daemon::new()?));
+
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
@@ -121,6 +137,51 @@ pub fn run_daemon() -> Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+fn try_connect() -> Result<IpcStream> {
+    ipc::connect()
+}
+
+fn handle_connection(stream: IpcStream, shared: Arc<Mutex<Daemon>>) -> Result<()> {
+    // Clone gives us two independent handles to the same pipe/socket so we
+    // can wrap one in BufReader and the other in BufWriter.
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .context("failed to clone daemon stream")?,
+    );
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .context("failed to read daemon request")?;
+    let request: Request =
+        serde_json::from_str(&request_line).context("failed to decode daemon request payload")?;
+
+    let response = {
+        let mut daemon = shared.lock().unwrap();
+        match daemon.handle(request) {
+            Ok(response) => response,
+            Err(error) => Response::Error {
+                message: format!("{error:#}"),
+            },
+        }
+    };
+
+    let mut writer = BufWriter::new(stream);
+    serde_json::to_writer(&mut writer, &response).context("failed to encode daemon response")?;
+    writer
+        .write_all(b"\n")
+        .context("failed to write daemon response terminator")?;
+    writer.flush().context("failed to flush daemon response")
+}
+
+// ---------------------------------------------------------------------------
+// Daemon state machine
+// ---------------------------------------------------------------------------
 
 struct Daemon {
     database_path: PathBuf,
@@ -145,8 +206,8 @@ impl Daemon {
                     ));
                 }
                 storage::initialize(&self.database_path)?;
-                let key = crate::crypto::generate_vault_key()?;
-                keychain::store_vault_key(&key)?;
+                let key = zeroize::Zeroizing::new(crate::crypto::generate_vault_key()?);
+                keychain::store_vault_key(key.as_slice())?;
                 Ok(Response::Ack {
                     message: "vault initialized".into(),
                 })
@@ -206,7 +267,7 @@ impl Daemon {
                         tags,
                         fields,
                     },
-                    &key,
+                    key.as_slice(),
                 )?;
                 Ok(Response::Ack {
                     message: format!("stored secret `{}`", metadata.id),
@@ -324,7 +385,7 @@ impl Daemon {
                     ));
                 }
                 biometric::authenticate("approve access to requested secrets")?;
-                let key = keychain::load_vault_key()?;
+                let key = zeroize::Zeroizing::new(keychain::load_vault_key()?);
                 let session = self
                     .session
                     .as_mut()
@@ -392,7 +453,8 @@ impl Daemon {
                 let key = session.unlocked_key.as_ref().ok_or_else(|| {
                     anyhow!("shared session is locked; approve a request to unlock it")
                 })?;
-                let all_fields = storage::read_secret_fields(&self.database_path, &id, key)?;
+                let all_fields =
+                    storage::read_secret_fields(&self.database_path, &id, key.as_slice())?;
                 let requested_fields = select_fields(&all_fields, &fields)?;
                 Ok(Response::SecretValues {
                     secret_id: id,
@@ -435,53 +497,20 @@ impl Daemon {
         }
     }
 
-    fn load_key_for_management(&self) -> Result<Vec<u8>> {
+    fn load_key_for_management(&self) -> Result<zeroize::Zeroizing<Vec<u8>>> {
         if let Some(session) = &self.session {
             if let Some(key) = &session.unlocked_key {
                 return Ok(key.clone());
             }
         }
         biometric::authenticate("unlock the password vault")?;
-        keychain::load_vault_key()
+        keychain::load_vault_key().map(zeroize::Zeroizing::new)
     }
 }
 
-fn try_connect() -> Result<UnixStream> {
-    let socket_path = paths::socket_path()?;
-    UnixStream::connect(&socket_path)
-        .with_context(|| format!("failed to connect to {}", socket_path.display()))
-}
-
-fn handle_connection(stream: UnixStream, shared: Arc<Mutex<Daemon>>) -> Result<()> {
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .context("failed to clone daemon stream")?,
-    );
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .context("failed to read daemon request")?;
-    let request: Request =
-        serde_json::from_str(&request_line).context("failed to decode daemon request payload")?;
-
-    let response = {
-        let mut daemon = shared.lock().unwrap();
-        match daemon.handle(request) {
-            Ok(response) => response,
-            Err(error) => Response::Error {
-                message: format!("{error:#}"),
-            },
-        }
-    };
-
-    let mut writer = BufWriter::new(stream);
-    serde_json::to_writer(&mut writer, &response).context("failed to encode daemon response")?;
-    writer
-        .write_all(b"\n")
-        .context("failed to write daemon response terminator")?;
-    writer.flush().context("failed to flush daemon response")
-}
+// ---------------------------------------------------------------------------
+// Selection helpers
+// ---------------------------------------------------------------------------
 
 fn select_requested_ids(requested: &[String], selection: &str) -> Result<BTreeSet<String>> {
     if selection == "all" {
@@ -560,6 +589,10 @@ fn select_fields(
     }
     Ok(result)
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
